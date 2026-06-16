@@ -1,0 +1,22 @@
+# build output
+build/
+cmake-build-*/
+*.o
+*.obj
+*.out
+a.out
+
+# compiled lab binaries
+reader
+clocksweep
+rbt
+btree
+sql_engine
+txmgr
+db_engine
+Btree
+
+# editor / OS
+.idea/
+.vscode/
+.DS_Store
