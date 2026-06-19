@@ -1,0 +1,182 @@
+# Lab Session 8: Modular Transaction Manager — MVCC + Strict 2PL + Deadlock Detection
+
+## Objective
+Take the Lab 6 transaction-manager prototype and package it as a proper module
+with all state **encapsulated inside a `TransactionManager` object** (the Lab 6
+version used global tables). The manager combines three mechanisms:
+
+1. **MVCC** — every write appends a new row version; readers use a snapshot and
+   never block writers.
+2. **Strict 2PL** — locks are taken in the growing phase and released all at once
+   at commit/abort (the shrinking phase is instantaneous at the end).
+3. **Deadlock detection** — a waits-for graph is checked for cycles on every
+   wait; a cycle throws `DeadlockException` so the caller can abort the victim.
+
+This mirrors the core of PostgreSQL's concurrency architecture (MVCC snapshot
+isolation + row-level locks).
+
+---
+
+## Why refactor Lab 6?
+Lab 6 stored everything in `static` globals (`g_transactions`, `g_heap`,
+`g_lock_table`, `g_waits_for`) and exposed free functions. That makes lifetime
+and ownership fuzzy and forbids more than one manager. Here every table is a
+member, the lock primitives are `private`, and only the transaction API is
+public:
+
+```
+txn_engine/
+├── transaction_manager.h    class TransactionManager  (namespace txn)
+├── transaction_manager.cpp  MVCC + 2PL + deadlock implementation
+├── main.cpp                 four demo scenarios
+└── CMakeLists.txt           builds target `txn_engine` (links Threads)
+```
+
+Public API:
+```cpp
+TxID begin();
+std::optional<std::string> read  (TxID, const RowKey&);   // SHARED lock
+void                       insert(TxID, const RowKey&, const std::string&);  // EXCLUSIVE
+void                       update(TxID, const RowKey&, const std::string&);  // EXCLUSIVE
+void                       remove(TxID, const RowKey&);                       // EXCLUSIVE
+void                       commit(TxID);
+void                       abort (TxID);
+```
+Locking is now an internal detail — the Lab 6 demo reached for `acquire_lock`
+directly to force a deadlock; here the same deadlock is produced purely through
+`update()`, which is how an application would actually hit one.
+
+---
+
+## Concepts
+
+### MVCC version visibility
+A version created by `xmin` and retired by `xmax` is visible to a reader with
+snapshot `S` and id `R` when:
+- `xmin == R` (our own write), **or** `xmin` is committed and `xmin < S`; and
+- `xmax == 0`, **or** `xmax != R` and not (`xmax` committed and `xmax < S`).
+
+```cpp
+INSERT  -> push_front {value, xmin=xid, xmax=0}
+UPDATE  -> stamp visible version's xmax=xid, push_front new version
+DELETE  -> stamp visible version's xmax=xid
+READ    -> walk chain newest-first, return first visible version
+```
+
+### Two-Phase Locking phases
+```
+GROWING:   may acquire locks, may NOT release   (acquire_lock here)
+SHRINKING: may release locks, may NOT acquire   (release_locks here)
+Strict 2PL: shrinking happens only at commit/abort -> no cascading aborts
+```
+`acquire_lock` refuses a lock once `in_shrinking` is set, enforcing the boundary.
+
+### Deadlock
+`waits_for_[waiter] = {holders…}`. Before sleeping on a conflict, the waiter
+records its edges and runs a DFS (`has_cycle`) over the graph; if its own node is
+reachable from itself, abort it with `DeadlockException`.
+
+---
+
+## Key implementation points
+- **Lock compatibility**: a request conflicts with an *earlier granted* request
+  iff either side is `EXCLUSIVE` (S/S is compatible, S/X, X/S, X/X are not). Only
+  earlier requests in the queue can block a request (FIFO fairness, no starvation).
+- **`std::list` for both version chains and lock queues** — node addresses stay
+  stable, so the `auto& my_req = lq.requests.back()` reference survives other
+  insertions while we loop and `cv.wait`.
+- **Lock ordering**: `acquire_lock` holds the per-key `lq.mu` and only briefly
+  grabs `lm_mutex_` (for `waits_for_` + cycle check); `release_locks` never holds
+  a `lq.mu` and `lm_mutex_` at the same time — so the two paths can't invert.
+- **ABORT undoes MVCC writes**: own inserts are hidden (`xmax=xid`), own deletes
+  are revived (`xmax=0`).
+
+---
+
+## Build & run
+```bash
+# CMake
+cmake -S txn_engine -B txn_engine/build
+cmake --build txn_engine/build
+./txn_engine/build/txn_engine
+
+# or directly
+g++ -std=c++17 -pthread -o txn_engine \
+    txn_engine/main.cpp txn_engine/transaction_manager.cpp
+./txn_engine
+```
+
+### Expected output (tx ids depend on how many transactions ran before each scenario)
+```
+=== Scenario 1: MVCC Snapshot Isolation ===
+[TX 1] COMMITTED
+[TX 3] COMMITTED
+  [TX 2] READ balance = 1000        <- sees pre-t3 snapshot, not 2000
+[TX 2] COMMITTED
+
+=== Scenario 2: Concurrent Shared Locks ===
+  [TX 4] READ balance = 2000
+  [TX 5] READ balance = 2000
+[TX 4] COMMITTED
+[TX 5] COMMITTED
+
+=== Scenario 3: Exclusive Lock + Waiting ===
+  [TX 7] waiting for shared lock on balance...
+[TX 6] COMMITTED
+  [TX 7] READ balance = 3000        <- unblocks only after t6 releases X-lock
+[TX 7] COMMITTED
+
+=== Scenario 4: Deadlock Detection ===
+[TX 8] COMMITTED
+[TX 9] COMMITTED
+  Deadlock detected, aborting tx 11
+[TX 11] ABORTED
+[TX 10] COMMITTED
+
+All scenarios complete.
+```
+
+---
+
+## Architecture
+```
+Application
+    │
+    ▼
+TransactionManager  begin / read / insert / update / remove / commit / abort
+    │
+    ├─► Lock manager (Strict 2PL)           [lock_table_ : per-key LockQueue]
+    │       growing : acquire S / X lock
+    │       shrinking: release all at commit/abort
+    │       deadlock : waits_for_ graph, DFS cycle check -> DeadlockException
+    │
+    └─► MVCC heap (version chain per row)    [heap_ : key -> list<RowVersion>]
+            walk newest-first, apply visibility rule against the tx snapshot
+```
+
+---
+
+## MVCC vs 2PL — why both
+| Property               | MVCC alone                    | 2PL alone                    | MVCC + Strict 2PL          |
+|------------------------|-------------------------------|------------------------------|----------------------------|
+| Read-write contention  | none (snapshots)              | readers block writers        | none (snapshots)           |
+| Write-write contention | last writer wins              | serialized via X-locks       | serialized via X-locks     |
+| Serializability        | Snapshot Isolation only       | serializable                 | serializable               |
+| Deadlock               | n/a                           | possible                     | possible -> needs detection|
+| Old-version cleanup    | needs vacuum/GC               | n/a                          | needs vacuum/GC            |
+
+PostgreSQL refines this with Serializable Snapshot Isolation (SSI), detecting
+dangerous read-write anti-dependencies instead of paying full 2PL throughput cost.
+
+---
+
+## Key Takeaways
+- Encapsulating the tables in the object (vs Lab 6's globals) fixes lifetime and
+  lets locking stay private — the deadlock now arises through the public API.
+- MVCC = a new version per write + a visibility rule checked against the snapshot
+  XID; readers never block writers.
+- Strict 2PL holds all locks to commit/abort, so the shrinking phase is one
+  instantaneous step and there are no cascading aborts.
+- Deadlock detection is an O(V+E) DFS over the waits-for graph per blocking wait;
+  PostgreSQL runs an equivalent check on a timer rather than per request.
+- ABORT must reverse MVCC effects: hide own inserts, revive own deletes.

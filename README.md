@@ -11,5 +11,6 @@ Advanced DBMS lab sessions. Specs live in [`lab_sessions/`](lab_sessions/).
 | 5 | Shunting-Yard + minimal SQL SELECT | [`query_parser/`](query_parser/) — `sql_engine.cpp` | `g++ -std=c++17 -o sql_engine sql_engine.cpp && ./sql_engine` |
 | 6 | MVCC + Strict 2PL + deadlock detection | [`txn_manager/`](txn_manager/) — `txn_manager.cpp` | `g++ -std=c++17 -pthread -o txmgr txn_manager.cpp && ./txmgr` |
 | 7 | Modular SQL query engine (shunting-yard + SELECT) | [`query_engine/`](query_engine/) — `shunting_yard.{h,cpp}`, `sql_parser.{h,cpp}`, `main.cpp` | `cmake -S query_engine -B query_engine/build && cmake --build query_engine/build && ./query_engine/build/query_engine` |
+| 8 | Modular transaction manager (MVCC + Strict 2PL + deadlock) | [`txn_engine/`](txn_engine/) — `transaction_manager.{h,cpp}`, `main.cpp` | `g++ -std=c++17 -pthread -o txn_engine txn_engine/main.cpp txn_engine/transaction_manager.cpp && ./txn_engine` |
 
 All programs build with C++17 (tested on Apple clang 17) and run standalone.
