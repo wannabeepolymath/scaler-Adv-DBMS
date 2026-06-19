@@ -10,6 +10,7 @@
 #include "concurrency/lock_manager.h"
 #include "concurrency/transaction_manager.h"
 #include "execution/execution.h"
+#include "recovery/log_manager.h"
 #include "sql/sql.h"
 #include "storage/disk_manager.h"
 
@@ -37,6 +38,10 @@ class Database {
   Catalog *GetCatalog() { return catalog_.get(); }
   BufferPoolManager *GetBufferPool() { return bpm_.get(); }
 
+  // Simulate a crash: subsequent destruction discards unflushed pages and leaves
+  // the WAL marked dirty, so the next open triggers recovery. (Testing/demo.)
+  void SimulateCrash();
+
  private:
   ResultSet ExecCreateTable(Statement *stmt);
   ResultSet ExecCreateIndex(Statement *stmt);
@@ -49,6 +54,12 @@ class Database {
 
   // Undo every write a transaction made, in reverse order (used by ROLLBACK).
   void UndoWrites(Transaction *txn);
+
+  // Replay the WAL after a crash: reset table data, then redo committed records.
+  void Recover();
+
+  // Append a row-level record to the WAL under the given log txn id.
+  void LogRow(LogType type, txn_id_t log_txn, const std::string &table, const Tuple &tuple);
 
   // Binding helpers: build the input column list for a SELECT (single table or
   // join), resolve column references in an expression to indices, resolve the
@@ -66,7 +77,9 @@ class Database {
   std::unique_ptr<Catalog> catalog_;
   std::unique_ptr<LockManager> lock_mgr_;
   std::unique_ptr<TransactionManager> txn_mgr_;
+  std::unique_ptr<LogManager> log_;
   Transaction *txn_{nullptr};  // current explicit transaction, or nullptr (auto-commit)
+  bool crashed_{false};        // set by SimulateCrash() — skip clean shutdown
 };
 
 }  // namespace minidb

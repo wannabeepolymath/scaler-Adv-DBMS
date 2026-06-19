@@ -104,6 +104,7 @@ bool BufferPoolManager::FlushPage(page_id_t page_id) {
 
 void BufferPoolManager::FlushAllPages() {
   std::lock_guard<std::mutex> g(latch_);
+  if (crashed_) return;  // crash simulation: discard unflushed pages
   for (auto &kv : page_table_) {
     Page &p = pages_[kv.second];
     if (p.is_dirty_) {

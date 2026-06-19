@@ -1,5 +1,8 @@
 #include "engine/database.h"
 
+#include <cstring>
+#include <unordered_set>
+
 #include "common/exception.h"
 #include "optimizer/optimizer.h"
 
@@ -7,14 +10,37 @@ namespace minidb {
 
 Database::Database(const std::string &db_file, size_t pool_size) {
   disk_ = std::make_unique<DiskManager>(db_file);
+  bool fresh = (disk_->GetNumPages() == 0);
   bpm_ = std::make_unique<BufferPoolManager>(pool_size, disk_.get());
   catalog_ = std::make_unique<Catalog>(bpm_.get());  // claims page 0
   lock_mgr_ = std::make_unique<LockManager>();
   txn_mgr_ = std::make_unique<TransactionManager>(lock_mgr_.get());
+  log_ = std::make_unique<LogManager>(db_file + ".wal");
+  if (fresh) {
+    log_->Reset();  // brand-new database: discard any stale WAL from a prior file
+  } else if (log_->CrashDetected()) {
+    Recover();  // previous run crashed: redo committed transactions from the WAL
+  }
 }
 
 Database::~Database() {
+  if (crashed_) return;  // simulated crash: leave pages unflushed + WAL dirty
   if (bpm_) bpm_->FlushAllPages();
+  if (log_) log_->MarkClean();  // record a clean shutdown so the next open skips recovery
+}
+
+void Database::SimulateCrash() {
+  crashed_ = true;
+  if (bpm_) bpm_->SimulateCrash();
+}
+
+void Database::LogRow(LogType type, txn_id_t log_txn, const std::string &table, const Tuple &tuple) {
+  LogRecord rec;
+  rec.type = type;
+  rec.txn = log_txn;
+  rec.table = table;
+  rec.tuple_bytes.assign(tuple.Data(), tuple.Size());
+  log_->Append(rec);
 }
 
 ResultSet Database::Execute(const std::string &sql) {
@@ -91,6 +117,10 @@ ResultSet Database::ExecInsert(Statement *stmt) {
   TableHeap *heap = catalog_->GetTableHeap(stmt->table);
   const Schema &schema = meta->schema;
 
+  // Operations run under the explicit transaction's id, or under a fresh
+  // auto-commit id (negative) when there is no active transaction.
+  txn_id_t log_txn = (txn_ != nullptr) ? txn_->GetId() : log_->NextAutoTxn();
+
   int count = 0;
   for (auto &row : stmt->rows) {
     if (row.size() != schema.GetColumnCount()) {
@@ -104,6 +134,7 @@ ResultSet Database::ExecInsert(Statement *stmt) {
       BPlusTree *tree = catalog_->GetIndex(stmt->table, idx.name);
       if (tree->Insert(row[idx.key_col], rid)) idx.distinct_keys++;
     }
+    LogRow(LogType::kInsert, log_txn, stmt->table, t);  // write-ahead log
     // Inside an explicit transaction: X-lock the new row (2PL) and log it for undo.
     if (txn_ != nullptr) {
       lock_mgr_->LockExclusive(txn_, rid);
@@ -112,7 +143,11 @@ ResultSet Database::ExecInsert(Statement *stmt) {
     count++;
   }
   meta->num_rows += static_cast<uint32_t>(count);
-  if (txn_ == nullptr) catalog_->Persist();  // auto-commit; explicit txns persist at COMMIT
+  if (txn_ == nullptr) {  // auto-commit: force-log the commit, then persist
+    log_->Append({LogType::kCommit, log_txn, "", ""});
+    log_->Flush();
+    catalog_->Persist();
+  }
   return {false, {}, {}, "INSERT " + std::to_string(count), count};
 }
 
@@ -137,6 +172,7 @@ ResultSet Database::ExecDelete(Statement *stmt) {
       victims.emplace_back(it.GetRID(), std::move(vals));
     }
   }
+  txn_id_t log_txn = (txn_ != nullptr) ? txn_->GetId() : log_->NextAutoTxn();
   for (auto &v : victims) {
     // Inside an explicit transaction: X-lock + capture the slot offset so the
     // delete can be undone (a tombstone keeps the tuple bytes in place).
@@ -145,6 +181,8 @@ ResultSet Database::ExecDelete(Statement *stmt) {
       uint16_t off = heap->PeekSlotOffset(v.first);
       txn_->Writes().push_back({WriteKind::kDelete, stmt->table, v.first, off});
     }
+    Tuple dt(v.second, schema);
+    LogRow(LogType::kDelete, log_txn, stmt->table, dt);  // write-ahead log (row identity)
     heap->MarkDelete(v.first);
     for (const auto &idx : meta->indexes) {
       BPlusTree *tree = catalog_->GetIndex(stmt->table, idx.name);
@@ -154,7 +192,11 @@ ResultSet Database::ExecDelete(Statement *stmt) {
   if (!victims.empty()) {
     auto n = static_cast<uint32_t>(victims.size());
     meta->num_rows = meta->num_rows >= n ? meta->num_rows - n : 0;
-    if (txn_ == nullptr) catalog_->Persist();  // explicit txns persist at COMMIT
+    if (txn_ == nullptr) {  // auto-commit: force-log the commit, then persist
+      log_->Append({LogType::kCommit, log_txn, "", ""});
+      log_->Flush();
+      catalog_->Persist();
+    }
   }
   return {false, {}, {}, "DELETE " + std::to_string(victims.size()), static_cast<int>(victims.size())};
 }
@@ -163,11 +205,14 @@ ResultSet Database::ExecDelete(Statement *stmt) {
 ResultSet Database::ExecBegin() {
   if (txn_ != nullptr) throw Exception(ErrorKind::kExecution, "a transaction is already in progress");
   txn_ = txn_mgr_->Begin();
+  log_->Append({LogType::kBegin, txn_->GetId(), "", ""});
   return {false, {}, {}, "BEGIN", 0};
 }
 
 ResultSet Database::ExecCommit() {
   if (txn_ == nullptr) throw Exception(ErrorKind::kExecution, "no transaction in progress");
+  log_->Append({LogType::kCommit, txn_->GetId(), "", ""});
+  log_->Flush();              // force-log-at-commit: durability point
   catalog_->Persist();        // make the transaction's effects durable
   txn_mgr_->Commit(txn_);     // release all locks (strict 2PL)
   txn_ = nullptr;
@@ -176,11 +221,72 @@ ResultSet Database::ExecCommit() {
 
 ResultSet Database::ExecRollback() {
   if (txn_ == nullptr) throw Exception(ErrorKind::kExecution, "no transaction in progress");
+  log_->Append({LogType::kAbort, txn_->GetId(), "", ""});
+  log_->Flush();
   UndoWrites(txn_);           // undo data changes in reverse order
   catalog_->Persist();        // persist the restored state
   txn_mgr_->Abort(txn_);      // release all locks
   txn_ = nullptr;
   return {false, {}, {}, "ROLLBACK", 0};
+}
+
+// Crash recovery (redo-only). Schemas survive on page 0; row data is rebuilt by
+// resetting every table to empty and replaying the committed WAL records.
+void Database::Recover() {
+  std::vector<LogRecord> records = log_->ReadAll();
+  std::unordered_set<txn_id_t> committed;
+  for (const auto &r : records) {
+    if (r.type == LogType::kCommit) committed.insert(r.txn);
+  }
+
+  // Reset every table's heap + indexes to a clean, empty baseline.
+  for (const std::string &name : catalog_->GetTableNames()) {
+    TableMeta *meta = catalog_->GetTable(name);
+    meta->first_page_id = TableHeap::CreateNew(bpm_.get());
+    meta->num_rows = 0;
+    for (auto &idx : meta->indexes) {
+      idx.root_page_id = INVALID_PAGE_ID;
+      idx.distinct_keys = 0;
+    }
+  }
+  catalog_->Persist();
+
+  // Redo the committed records, in order.
+  for (const auto &r : records) {
+    if (r.type != LogType::kInsert && r.type != LogType::kDelete) continue;
+    if (committed.count(r.txn) == 0) continue;  // uncommitted at crash: skip
+    TableMeta *meta = catalog_->GetTable(r.table);
+    if (meta == nullptr) continue;
+    TableHeap *heap = catalog_->GetTableHeap(r.table);
+    const Schema &schema = meta->schema;
+    Tuple t;
+    t.SetData(r.tuple_bytes.data(), static_cast<uint32_t>(r.tuple_bytes.size()));
+
+    if (r.type == LogType::kInsert) {
+      RID rid;
+      if (!heap->InsertTuple(t, &rid)) continue;
+      for (auto &idx : meta->indexes) {
+        if (catalog_->GetIndex(r.table, idx.name)->Insert(t.GetValue(schema, idx.key_col), rid)) {
+          idx.distinct_keys++;
+        }
+      }
+      meta->num_rows++;
+    } else {  // kDelete: find the live row with identical bytes and remove it
+      for (auto it = heap->Begin(); it != heap->End(); ++it) {
+        Tuple cur = *it;
+        if (cur.Size() == t.Size() && std::memcmp(cur.Data(), t.Data(), t.Size()) == 0) {
+          RID rid = it.GetRID();
+          for (auto &idx : meta->indexes) {
+            catalog_->GetIndex(r.table, idx.name)->Delete(t.GetValue(schema, idx.key_col), rid);
+          }
+          heap->MarkDelete(rid);
+          if (meta->num_rows > 0) meta->num_rows--;
+          break;
+        }
+      }
+    }
+  }
+  catalog_->Persist();
 }
 
 void Database::UndoWrites(Transaction *txn) {

@@ -40,6 +40,10 @@ class BufferPoolManager {
 
   bool DeletePage(page_id_t page_id);
 
+  // Simulate a crash: drop all in-memory (unflushed) pages on shutdown so the
+  // data file is left at its last-flushed state. Used to exercise WAL recovery.
+  void SimulateCrash() { crashed_ = true; }
+
   size_t GetPoolSize() const { return pool_size_; }
   DiskManager *GetDiskManager() { return disk_manager_; }
 
@@ -62,6 +66,7 @@ class BufferPoolManager {
 
   size_t num_hits_{0};
   size_t num_misses_{0};
+  bool crashed_{false};  // when set, FlushAllPages is a no-op (crash simulation)
 };
 
 }  // namespace minidb
