@@ -37,6 +37,7 @@ class Database {
 
  private:
   ResultSet ExecCreateTable(Statement *stmt);
+  ResultSet ExecCreateIndex(Statement *stmt);
   ResultSet ExecInsert(Statement *stmt);
   ResultSet ExecDelete(Statement *stmt);
   ResultSet ExecSelect(Statement *stmt);

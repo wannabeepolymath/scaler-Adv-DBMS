@@ -55,7 +55,7 @@ struct Reader {
   }
 };
 
-constexpr uint32_t CATALOG_MAGIC = 0x4D444243;  // "MDBC"
+constexpr uint32_t CATALOG_MAGIC = 0x4D444244;  // "MDBD" (bumped: adds num_rows + distinct_keys)
 }  // namespace
 
 Catalog::Catalog(BufferPoolManager *bpm) : bpm_(bpm) {
@@ -81,6 +81,7 @@ void Catalog::Persist() {
     const TableMeta &t = kv.second;
     w.Str(t.name);
     w.I32(t.first_page_id);
+    w.U32(t.num_rows);
     const auto &cols = t.schema.GetColumns();
     w.U16(static_cast<uint16_t>(cols.size()));
     for (const auto &c : cols) {
@@ -93,6 +94,7 @@ void Catalog::Persist() {
       w.Str(idx.name);
       w.I32(idx.root_page_id);
       w.U32(idx.key_col);
+      w.U32(idx.distinct_keys);
     }
   }
   if (w.buf.size() > PAGE_SIZE) {
@@ -118,6 +120,7 @@ void Catalog::Load() {
     TableMeta t;
     t.name = r.Str();
     t.first_page_id = r.I32();
+    t.num_rows = r.U32();
     uint16_t num_cols = r.U16();
     std::vector<Column> cols;
     for (uint16_t c = 0; c < num_cols; c++) {
@@ -133,6 +136,7 @@ void Catalog::Load() {
       idx.name = r.Str();
       idx.root_page_id = r.I32();
       idx.key_col = r.U32();
+      idx.distinct_keys = r.U32();
       t.indexes.push_back(idx);
     }
     tables_[t.name] = std::move(t);
@@ -195,6 +199,31 @@ TableHeap *Catalog::GetTableHeap(const std::string &name) {
   if (t == nullptr) return nullptr;
   heaps_[name] = std::make_unique<TableHeap>(bpm_, t->first_page_id);
   return heaps_[name].get();
+}
+
+BPlusTree *Catalog::GetIndex(const std::string &table, const std::string &index) {
+  std::string key = table + "." + index;
+  auto it = indexes_.find(key);
+  if (it != indexes_.end()) return it->second.get();
+
+  TableMeta *t = GetTable(table);
+  if (t == nullptr) return nullptr;
+  IndexMeta *im = nullptr;
+  for (auto &idx : t->indexes) {
+    if (idx.name == index) {
+      im = &idx;
+      break;
+    }
+  }
+  if (im == nullptr) return nullptr;
+
+  const Column &col = t->schema.GetColumn(im->key_col);
+  uint32_t kw = KeyWidth(col.type, col.length);
+  // When the tree's root changes, persist it back into the catalog.
+  auto on_root = [this, table, index](page_id_t r) { SetIndexRoot(table, index, r); };
+  indexes_[key] =
+      std::make_unique<BPlusTree>(bpm_, im->root_page_id, col.type, kw, on_root);
+  return indexes_[key].get();
 }
 
 }  // namespace minidb
