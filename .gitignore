@@ -15,6 +15,8 @@ sql_engine
 txmgr
 db_engine
 Btree
+query_engine/query_engine
+txn_engine/txn_engine
 
 # editor / OS
 .idea/

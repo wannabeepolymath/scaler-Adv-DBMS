@@ -1,0 +1,182 @@
+# Lab Session 7: Modular SQL Query Engine — Shunting-Yard + SELECT Parser/Executor
+
+## Objective
+Refactor the single-file expression+SELECT prototype from Lab 5 into a small,
+multi-file query engine the way a real codebase is laid out:
+
+1. **`shunting_yard`** — Dijkstra's shunting-yard algorithm: tokenize an infix
+   expression, convert it to RPN (postfix), and evaluate the RPN on a stack.
+2. **`sql_parser`** — parse a SQL `SELECT` statement into a small query AST and
+   execute it (filter -> project -> sort -> limit) over an in-memory `vector<Row>`.
+3. **`main`** — a driver that demonstrates both halves end-to-end.
+
+This is the parsing/execution front end of a database: the same flow PostgreSQL
+runs as lexer -> parser -> planner -> executor, minus the planner.
+
+---
+
+## Why split it into modules?
+Lab 5 kept everything in one `.cpp`. Real engines separate the *expression
+evaluator* (reused by WHERE, CHECK constraints, computed columns, index
+predicates) from the *statement parser* (specific to SELECT/INSERT/UPDATE). The
+header/implementation split here mirrors that: `shunting_yard.h` is a reusable
+component that `sql_parser` depends on, and both are compiled into one binary by
+CMake.
+
+```
+query_engine/
+├── shunting_yard.h / .cpp   reusable expression evaluator  (namespace sy)
+├── sql_parser.h    / .cpp   SELECT parser + executor        (namespace sql)
+├── main.cpp                 demo driver
+└── CMakeLists.txt           builds target `query_engine`
+```
+
+---
+
+## Part 1: Shunting-Yard (namespace `sy`)
+
+### Background
+A SQL `WHERE` clause is an infix expression: `age >= 22 && age <= 26`. The
+shunting-yard algorithm converts infix to RPN in O(n) using one operator stack,
+honouring operator **precedence** and **associativity**. RPN then evaluates with
+a single value stack — no recursion, no parse tree needed.
+
+### Operator table (precedence low -> high)
+```
+||  (1)   logical OR
+&&  (2)   logical AND
+=  !=  (3)   equality
+<  >  <=  >=  (4)   comparison
++  -  (5)
+*  /  (6)
+^  (7, right-associative)   exponentiation
+```
+
+### API (`shunting_yard.h`)
+```cpp
+namespace sy {
+    std::vector<std::string> tokenize(const std::string& expr);
+    std::vector<std::string> to_rpn(const std::vector<std::string>& tokens);
+    double eval_rpn(const std::vector<std::string>& rpn,
+                    const std::unordered_map<std::string, double>& vars);
+}
+```
+
+`eval_rpn` treats every value as a `double`; booleans are encoded as `1.0`/`0.0`,
+so comparison and logical operators compose naturally (`a >= 22 && a <= 26`
+becomes `1.0 && 1.0 -> 1.0`). Identifiers are resolved through the `vars` map;
+numeric literals are parsed with `std::stod`. Both `tokenize` and `to_rpn` raise
+`std::runtime_error` on mismatched parentheses, and `eval_rpn` raises on an
+unknown identifier or a malformed stack.
+
+---
+
+## Part 2: SQL SELECT (namespace `sql`)
+
+### Row + Value
+```cpp
+using Value = std::variant<double, std::string>;   // SQLite-style dynamic typing
+struct Row  { std::unordered_map<std::string, Value> cols; };
+```
+
+### Parsed query (the "AST")
+```cpp
+struct SelectQuery {
+    std::vector<std::string> columns;    // empty == SELECT *
+    std::string              from;       // table name (data is pre-fetched)
+    std::string              where_raw;  // raw WHERE clause string
+    std::string              order_by;
+    bool                     order_asc = true;
+    int                      limit = -1;
+};
+```
+
+`parse_select` is a hand-written recursive-free tokenizer over `istringstream`:
+read the column list until `FROM`, the table name, then optional `WHERE` /
+`ORDER BY [DESC]` / `LIMIT` clauses (all keyword-matching is case-insensitive).
+
+### Execution order
+```
+execute(q, data):
+    rpn = to_rpn(tokenize(q.where_raw))          // compile WHERE once
+    for row in data:
+        if WHERE and !eval_rpn(rpn, vars(row)): skip   // 1. FILTER
+        emit full row or projected columns              // 2. PROJECT
+    stable-ish sort by order_by (asc/desc)              // 3. SORT
+    truncate to limit                                   // 4. LIMIT
+```
+
+The WHERE expression is converted to RPN **once** and re-evaluated per row, so
+parsing cost is paid a single time — the same reason real planners compile a
+predicate into an expression tree instead of re-parsing each tuple.
+
+---
+
+## Build & run
+```bash
+# CMake
+cmake -S query_engine -B query_engine/build
+cmake --build query_engine/build
+./query_engine/build/query_engine
+
+# or directly
+g++ -std=c++17 -o query_engine \
+    query_engine/main.cpp query_engine/shunting_yard.cpp query_engine/sql_parser.cpp
+./query_engine
+```
+
+### Expected output
+```
+=== Part 1: Shunting-Yard expression evaluator ===
+Expression : age * 2 + salary / 1000 > 100
+RPN        : age 2 * salary 1000 / + 100 >
+Result     : true
+
+=== Part 2: SQL SELECT over in-memory rows ===
+SQL: SELECT id, name, gpa FROM students WHERE gpa > 3.0 ORDER BY gpa DESC LIMIT 3
+  id=1  name=Alice  gpa=3.8
+  id=3  name=Carol  gpa=3.5
+  id=4  name=Dave  gpa=3.1
+
+SQL: SELECT * FROM students WHERE age >= 22 && age <= 26
+  ... Alice, Bob ...
+
+SQL: SELECT name FROM students WHERE (gpa > 3.4 || age < 22) && id != 1
+  name=Carol
+```
+(`std::unordered_map` does not preserve column order, so columns inside a row may
+print in any order — values are what matter.)
+
+---
+
+## How this maps to a real database
+```
+SQL string
+   │  tokenize / parse_select          <- this lab (lexer + parser)
+   ▼
+SelectQuery (AST)
+   │  planner: index vs seq scan, join order   <- NOT implemented
+   ▼
+Executor: FILTER -> PROJECT -> SORT -> LIMIT   <- this lab (execute)
+   │  WHERE predicate compiled to RPN via shunting-yard
+   ▼
+Result set (vector<Row>)
+```
+- The `vector<Row>` stands in for the output of a storage layer (Labs 2–3) — the
+  pages a real planner would have chosen to scan.
+- A production engine compiles WHERE into an expression tree at plan time;
+  shunting-yard is the mechanism that builds the operator ordering that tree needs.
+
+---
+
+## Key Takeaways
+- Shunting-yard converts infix -> RPN in O(n) with a single operator stack;
+  precedence + associativity fully determine the output order.
+- Encoding booleans as `1.0`/`0.0` lets one numeric stack evaluate arithmetic,
+  comparison, and logical operators uniformly.
+- A minimal SELECT executor is just FILTER (WHERE) -> PROJECT (columns) ->
+  SORT (ORDER BY) -> TRUNCATE (LIMIT).
+- Splitting the evaluator (`sy`) from the statement parser (`sql`) is the same
+  separation real engines use so the expression evaluator can be reused beyond
+  WHERE (CHECK constraints, index predicates, computed columns).
+- Compile the predicate once (to RPN), evaluate per row — never re-parse per tuple.
